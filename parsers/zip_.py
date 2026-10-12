@@ -63,12 +63,23 @@ class parser(FType):
 		if len(parasite_data) > self.parasite_s:
 			return None, []
 
-		# ZIP64 central directories/EOCDs aren't handled by this raw-copy path
-		if original.rfind(self.ZIP64_EOCD) != -1 or original.rfind(self.ZIP64_LOCATOR) != -1:
+		eocd_o = original.rfind(self.EOCD)
+		if eocd_o == -1 or eocd_o + 22 > len(original):
 			return None, []
 
-		eocd_o = original.rfind(self.EOCD)
-		if eocd_o == -1:
+		# ZIP64 isn't handled by this raw-copy path. Its locator sits
+		# right before the EOCD (20 bytes); searching the whole file
+		# would false-positive on compressed data.
+		if original[eocd_o - 20:eocd_o - 16] == self.ZIP64_LOCATOR:
+			return None, []
+
+		# refuse rather than silently wrap a counter/offset that is full
+		entries = struct.unpack_from("<H", original, eocd_o + 10)[0]
+		cd_size = struct.unpack_from("<I", original, eocd_o + 12)[0]
+		cd_offset = struct.unpack_from("<I", original, eocd_o + 16)[0]
+		if entries >= 0xFFFF \
+			or cd_size + 46 >= 0xFFFFFFFF \
+			or cd_offset + len(parasite_data) + 30 + 46 >= 0xFFFFFFFF:
 			return None, []
 
 		crc = binascii.crc32(parasite_data) & 0xffffffff
@@ -126,5 +137,6 @@ class parser(FType):
 		patch32(eocd_o + 12, len(cd_record))    # central directory size
 		patch32(eocd_o + 16, delta)             # central directory offset
 
-		swaps = [delta, delta + len(cd_record)]
+		# the parasite's bytes sit right after its local header
+		swaps = [len(local_header), len(local_header) + size]
 		return bytes(new_data), swaps

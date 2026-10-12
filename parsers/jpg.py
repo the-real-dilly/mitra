@@ -40,16 +40,6 @@ class parser(FType):
 		return True
 
 
-	def getPrewrap(self, parasite_s):
-		# total header overhead once `parasite_s` bytes are chained
-		# across as many segments as wrap() will emit for them
-		if parasite_s <= 0:
-			n_segments = 1
-		else:
-			n_segments = -(-parasite_s // self.MAXSEG) # ceil division
-		return n_segments * self.prewrap
-
-
 	def wrap(self, parasite, marker=b"\xFE"):
 		# chain the parasite across as many back-to-back marker segments
 		# as needed - JPEG decoders simply walk from one marker segment
