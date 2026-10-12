@@ -130,18 +130,24 @@ class parser(FType):
 		# A shifted value must still fit its field: placeholder values
 		# (0xFFFFFFFF...) or 16-bit SHORT offsets overflow once a large
 		# delta is added, which makes struct.pack raise. Skip those.
+		# A zero is a null pointer (end of the IFD chain, absent value): it
+		# points at nothing, so it must stay zero.
 		def do_inc4(o):
 			nonlocal d
-			if safe_inc(o, 4) and get4(d, o, e) + delta <= 0xFFFFFFFF:
-				d = inc4(d, o, delta, e)
-				return True
+			if safe_inc(o, 4):
+				v = get4(d, o, e)
+				if v != 0 and v + delta <= 0xFFFFFFFF:
+					d = inc4(d, o, delta, e)
+					return True
 			return False
 
 		def do_inc2(o):
 			nonlocal d
-			if safe_inc(o, 2) and get2(d, o, e) + delta <= 0xFFFF:
-				d = inc2(d, o, delta, e)
-				return True
+			if safe_inc(o, 2):
+				v = get2(d, o, e)
+				if v != 0 and v + delta <= 0xFFFF:
+					d = inc2(d, o, delta, e)
+					return True
 			return False
 
 		# a worklist of field offsets whose 4-byte value is itself an
