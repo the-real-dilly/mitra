@@ -38,6 +38,29 @@ def get4(d, o, e):
 	return struct.unpack(e[0] + "I", d[o:o+4])[0]
 
 
+def inc2l(d, o, delta):
+	s = 2
+	v = struct.unpack("<H", d[o:o+s])[0]
+	v += delta
+	d = d[:o] + struct.pack("<H", v) + d[o+s:]
+	return d
+
+def inc2b(d, o, delta):
+	s = 2
+	v = struct.unpack(">H", d[o:o+s])[0]
+	v += delta
+	d = d[:o] + struct.pack(">H", v) + d[o+s:]
+	return d
+
+def inc2(d, o, delta, e):
+	assert e[0] in "<>"
+	s = 2
+	v = struct.unpack(e[0] + "H", d[o:o+s])[0]
+	v += delta
+	d = d[:o] + struct.pack(e[0] + "H", v) + d[o+s:]
+	return d
+
+
 def inc4l(d, o, delta):
 	s = 4
 	v = struct.unpack("<I", d[o:o+s])[0]

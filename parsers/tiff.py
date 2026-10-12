@@ -6,8 +6,18 @@ from helpers import *
 
 # Strategy:
 # 1. move parasite right after File Header
-# 2. adjust IFD pointers
-# 3. adjust StripOffsets values
+# 2. adjust every IFD pointer (main chain + sub-IFDs)
+# 3. adjust every tag value that is itself a file offset:
+#    - out-of-line tag values (count*typesize > 4) are pointers to a data
+#      block that moved by delta
+#    - offset-array tags (StripOffsets/TileOffsets/FreeOffsets) also need
+#      each element of the array shifted, since those elements are
+#      themselves offsets into the (now shifted) pixel data
+#    - IFD-pointer tags (SubIFDs/ExifIFD/GPSIFD/InteropIFD) point to other
+#      IFDs, which are walked recursively
+#
+# Not supported: BigTIFF (different magic, 8-byte offsets) - identify()
+# won't match it, so it's just rejected rather than mishandled.
 
 
 BYTE =			1
@@ -15,6 +25,13 @@ ASCII =			2
 SHORT =			3
 LONG = 			4
 RATIONAL = 	5
+SBYTE =			6
+UNDEFINED =	7
+SSHORT =		8
+SLONG =			9
+SRATIONAL =	10
+FLOAT =			11
+DOUBLE =		12
 
 
 Lengths = {
@@ -23,7 +40,33 @@ Lengths = {
 	SHORT			:2,
 	LONG			:4,
 	RATIONAL	:8,
+	SBYTE			:1,
+	UNDEFINED	:1,
+	SSHORT		:2,
+	SLONG			:4,
+	SRATIONAL	:8,
+	FLOAT			:4,
+	DOUBLE		:8,
 }
+
+# tags whose value is an array of offsets pointing into the image data
+OFFSET_ARRAY_TAGS = {
+	273,  # StripOffsets
+	288,  # FreeOffsets
+	324,  # TileOffsets
+}
+
+# tags whose value is an offset to another IFD
+SUBIFD_PTR_TAGS = {
+	330,    # SubIFDs
+	34665,  # ExifIFD
+	34853,  # GPSIFD
+	40965,  # InteropIFD
+}
+
+# tag whose (single) value is a raw data offset, not an IFD
+JPEG_OFFSET_TAG = 513  # JPEGInterchangeFormat (old-style JPEG-in-TIFF)
+
 
 class parser(FType):
 	DESC = "TIFF / Tagged Image File Format"
@@ -72,32 +115,106 @@ class parser(FType):
 
 
 	def fixformat(self, d, delta):
-		o = self.ifdptr_o
-		while o != 0:
-			d = inc4(d, o, delta, self.endianness)
-			o = get4(d, o, self.endianness)
+		e = self.endianness
 
-			c = get2(d, o, self.endianness) # entries count
+		# Many real-world (and especially minimal/PoC) TIFFs have offsets
+		# or array elements that don't actually resolve to valid in-file
+		# locations (truncated test fixtures, placeholder/zero values...).
+		# Treat every offset fix as best-effort: skip silently rather than
+		# raising if the target field would fall outside the buffer.
+		def safe_inc(o, size):
+			if o < 0 or o + size > len(d):
+				return False
+			return True
+
+		def do_inc4(o):
+			nonlocal d
+			if safe_inc(o, 4):
+				d = inc4(d, o, delta, e)
+				return True
+			return False
+
+		def do_inc2(o):
+			nonlocal d
+			if safe_inc(o, 2):
+				d = inc2(d, o, delta, e)
+				return True
+			return False
+
+		# a worklist of field offsets whose 4-byte value is itself an
+		# offset to an IFD that needs to be shifted by delta and walked.
+		# starts with the pointer to the first IFD; grows with "next IFD"
+		# pointers and with sub-IFD pointer tags as they're discovered.
+		worklist = [self.ifdptr_o]
+		seen = set()
+
+		while worklist:
+			ptr_o = worklist.pop(0)
+			if ptr_o in seen:
+				continue
+			seen.add(ptr_o)
+
+			if not do_inc4(ptr_o):
+				continue
+			ifd_o = get4(d, ptr_o, e)
+			if ifd_o == 0 or ifd_o + 2 > len(d):
+				continue
+
+			o = ifd_o
+			c = get2(d, o, e)  # entries count
 			o += 2
 
 			for i in range(c):
-				tag = get2(d, o, self.endianness)
-				o += 2
-				type_ = get2(d, o, self.endianness)
-				o += 2
-				count = get4(d, o, self.endianness)
-				o += 4
-				valoff = get4(d, o, self.endianness)
+				if o + 12 > len(d):
+					# truncated/bogus IFD - stop walking this table
+					break
 
-				if tag == 273: # StripOffsets
-					# print(tag, type_, count, valoff)
-					if type_ == LONG and count == 1:
-						d = inc4(d, o, delta, self.endianness)
-					else: 
-						raise Exception("TIFF", "TODO: handle more cases")
+				tag = get2(d, o, e)
+				type_ = get2(d, o + 2, e)
+				count = get4(d, o + 4, e)
+				val_o = o + 8
 
-				o += 4
+				typesize = Lengths.get(type_, 1)
+				out_of_line = typesize * count > 4
 
-			o = get4(d, o, self.endianness)
+				if out_of_line:
+					# the value field is a pointer to a data block
+					# that moved along with everything else
+					if do_inc4(val_o):
+						dataoff = get4(d, val_o, e)
+
+						if tag in OFFSET_ARRAY_TAGS:
+							if type_ == LONG:
+								for j in range(count):
+									do_inc4(dataoff + 4 * j)
+							elif type_ == SHORT:
+								for j in range(count):
+									do_inc2(dataoff + 2 * j)
+							# else: unsupported offset-array type - leave untouched
+
+						elif tag in SUBIFD_PTR_TAGS and type_ == LONG:
+							for j in range(count):
+								worklist.append(dataoff + 4 * j)
+
+				else:
+					if tag in OFFSET_ARRAY_TAGS:
+						if type_ == LONG and count == 1:
+							do_inc4(val_o)
+						elif type_ == SHORT and count in (1, 2):
+							for j in range(count):
+								do_inc2(val_o + 2 * j)
+
+					elif tag in SUBIFD_PTR_TAGS:
+						# single inline IFD offset (count == 1, LONG, fits in 4 bytes)
+						worklist.append(val_o)
+
+					elif tag == JPEG_OFFSET_TAG:
+						do_inc4(val_o)
+
+				o += 12  # tag:2 type:2 count:4 value:4
+
+			# "next IFD" pointer field, right after the last entry
+			if o + 4 <= len(d):
+				worklist.append(o)
 
 		return d

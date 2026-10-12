@@ -17,11 +17,23 @@ class parser(FType):
 
 		self.bParasite = True
 		self.parasite_o = 0x10
-		self.parasite_s = 0xFFFFFFFF
+		# PNG chunk lengths are specified as not exceeding 2^31-1,
+		# even though the length field itself is 4 unsigned bytes
+		self.parasite_s = 0x7FFFFFFF
 
 		self.cut = 8   # Just after the magic, before IHDR.
 		self.prewrap = 2*4 # Length:4, Type:4
 		self.postwrap = 4  # CRC:4
+
+
+	def identify(self):
+		d = self.data
+		if not d.startswith(self.MAGIC):
+			return False
+		# the signature must be immediately followed by an IHDR chunk
+		# (length 13, type IHDR) - rules out random data that merely
+		# happens to start with the PNG signature
+		return d[8:16] == b"\0\0\0\x0dIHDR"
 
 
 	def wrap(self, data, type_=b"cOMM"):

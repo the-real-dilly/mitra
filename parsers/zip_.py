@@ -1,22 +1,37 @@
 #!/usr/bin/env python3
 
-import io
-import zipfile
-import os
+import binascii
+import struct
 from parsers import FType
+
+
+def _dos_datetime(dt):
+	year, month, day, hour, minute, second = dt
+	dosdate = ((year - 1980) << 9) | (month << 5) | day
+	dostime = (hour << 11) | (minute << 5) | (second // 2)
+	return dostime, dosdate
+
 
 class parser(FType):
 	DESC = "Zip"
 	TYPE = "Zip"
 	MAGIC = b"PK\3\4"
 
+	EOCD = b"PK\x05\x06"
+	ZIP64_EOCD = b"PK\x06\x06"
+	ZIP64_LOCATOR = b"PK\x06\x07"
+
 	def __init__(self, data=""):
 		FType.__init__(self, data)
 		self.data = data
 
 		self.bParasite = True
-		self.parasite_o = 0x1E # depends on archived file name
-		self.parasite_s = 0xffffff # ?
+		# the parasite is stored as the very first bytes of the file
+		# (local header + raw data), so it's always at offset 0
+		self.parasite_o = 0
+		# 32-bit stored/uncompressed size fields; 0xFFFFFFFF is reserved
+		# as the ZIP64 escape value, so the real cap is one less
+		self.parasite_s = 0xFFFFFFFE
 
 		self.start_o = 4*1024*1024 # no actual downward limit
 
@@ -26,28 +41,90 @@ class parser(FType):
 
 
 	def identify(self):
-		return self.data.startswith(self.MAGIC) # totally incomplete
+		if not self.data.startswith(self.MAGIC):
+			return False
+		# a well-formed zip has an End Of Central Directory record,
+		# within the last 64KB + 22 bytes (max comment length)
+		return self.data.rfind(self.EOCD) != -1
 
 
 	def parasitize(self, fparasite):
-		# TODO: with no recompression
+		# Strategy: store the parasite as a new, raw-STORED first entry,
+		# prepended before the host's own data, then patch the central
+		# directory in place rather than decompressing/recompressing
+		# every existing member. This preserves the host's original
+		# compression, flags, extra fields, timestamps and comment
+		# byte-for-byte, and works even on members this tool can't
+		# itself decompress (encrypted, exotic methods...).
 
-		# strategy: just store the parasite as first invisible file with no compression
-		zipinfo = zipfile.ZipInfo(
-			filename='', # it works - sometimes hidden by software
-			date_time=(1981, 2, 3, 4, 5, 6) # invariant for easier testing
-		) 
+		original = self.data
+		parasite_data = fparasite.data
 
-		hHost = io.BytesIO(self.data)
-		hFinal = io.BytesIO()
+		if len(parasite_data) > self.parasite_s:
+			return None, []
 
-		with zipfile.ZipFile(hFinal, 'w', zipfile.ZIP_STORED) as final:
-			final.writestr(zipinfo, fparasite.data)
+		# ZIP64 central directories/EOCDs aren't handled by this raw-copy path
+		if original.rfind(self.ZIP64_EOCD) != -1 or original.rfind(self.ZIP64_LOCATOR) != -1:
+			return None, []
 
-			with zipfile.ZipFile(hHost, "r") as zf:
-				for n in zf.namelist():
-						contents = zf.open(n).read()
-						final.writestr(zf.getinfo(n), contents, compress_type=zipfile.ZIP_DEFLATED)
+		eocd_o = original.rfind(self.EOCD)
+		if eocd_o == -1:
+			return None, []
 
-		swaps = [0x1e, 0x1e + len(fparasite.data)]
-		return hFinal.getvalue(), swaps
+		crc = binascii.crc32(parasite_data) & 0xffffffff
+		size = len(parasite_data)
+		dostime, dosdate = _dos_datetime((1981, 2, 3, 4, 5, 6)) # invariant for easier testing
+
+		local_header = struct.pack("<4sHHHHHIIIHH",
+			b"PK\x03\x04",   # local file header signature
+			20,              # version needed to extract
+			0,               # flags
+			0,               # compression method: stored
+			dostime, dosdate,
+			crc,
+			size, size,      # compressed size, uncompressed size
+			0, 0)            # filename length, extra length (no filename)
+
+		parasite_entry = local_header + parasite_data
+		delta = len(parasite_entry)
+
+		new_data = bytearray(parasite_entry)
+		new_data += original
+
+		# everything that was in the original file moved by `delta`
+		eocd_o += delta
+
+		cd_record = struct.pack("<4sHHHHHHIIIHHHHHII",
+			b"PK\x01\x02",   # central directory file header signature
+			20, 20,          # version made by, version needed to extract
+			0,               # flags
+			0,               # compression method: stored
+			dostime, dosdate,
+			crc,
+			size, size,      # compressed size, uncompressed size
+			0, 0, 0,         # filename, extra, comment lengths
+			0,               # disk number start
+			0,               # internal attributes
+			0,               # external attributes
+			0)               # relative offset of local header: first bytes of the file
+
+		new_data = new_data[:eocd_o] + cd_record + new_data[eocd_o:]
+		eocd_o += len(cd_record)
+
+		def patch16(o, inc):
+			v = (struct.unpack_from("<H", new_data, o)[0] + inc) & 0xffff
+			struct.pack_into("<H", new_data, o, v)
+
+		def patch32(o, inc):
+			v = (struct.unpack_from("<I", new_data, o)[0] + inc) & 0xffffffff
+			struct.pack_into("<I", new_data, o, v)
+
+		# EOCD layout: sig:4 disk:2 cddisk:2 entries_here:2 entries_total:2
+		#              cd_size:4 cd_offset:4 comment_len:2
+		patch16(eocd_o + 8, 1)                  # entries on this disk
+		patch16(eocd_o + 10, 1)                 # total entries
+		patch32(eocd_o + 12, len(cd_record))    # central directory size
+		patch32(eocd_o + 16, delta)             # central directory offset
+
+		swaps = [delta, delta + len(cd_record)]
+		return bytes(new_data), swaps
