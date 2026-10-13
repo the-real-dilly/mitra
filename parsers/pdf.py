@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 
-import fitz # PyMuPDF
 import os
 import re
 from parsers import FType
+
+# PyMuPDF is only needed for normalize(); importing it at module level would
+# make the whole tool unusable (every parser, not just PDF) when it's
+# missing, since mitra.py does `from parsers import *`.
+try:
+	import fitz # PyMuPDF
+except ImportError:
+	fitz = None
 
 # Strategy:
 # 1. merge with a dummy single page doc to make room for an empty stream object at slot 1
@@ -15,8 +22,14 @@ from parsers import FType
 
 
 def EnclosedString(d, starts, ends):
-	off = d.find(starts) + len(starts)
-	return d[off:d.find(ends, off)]
+	pos = d.find(starts)
+	if pos == -1:
+		return b""
+	off = pos + len(starts)
+	end = d.find(ends, off)
+	if end == -1:
+		return b""
+	return d[off:end]
 
 assert EnclosedString(b"/Kids[1 0 R]", b"/Kids[", b"]") == b"1 0 R"
 
@@ -42,10 +55,11 @@ assert getObjDecl(b"/Outlines 1 0 R", b"/Outlines") == b"/Outlines 1 0 R"
 
 def getValDecl(d, s):
 	"""locates declaration such as '/PageMode /UseOutlines' """
-	off = d.find(s) + len(s)
-	if off == -1:
+	pos = d.find(s)
+	if pos == -1:
 		return b""
-	match = re.match(b" *\/[A-Za-z0-9]*", d[off:])
+	off = pos + len(s)
+	match = re.match(b" */[A-Za-z0-9]*", d[off:])
 	if match is None:
 		return b""
 	else:
@@ -173,6 +187,9 @@ class parser(FType):
 
 	def normalize(self):
 		_DEBUG_FILES = 0
+
+		if fitz is None:
+			raise RuntimeError("PDF parasitizing requires PyMuPDF (pip install PyMuPDF)")
 
 		# Merging with a dummy page
 		with fitz.open() as mergedDoc:

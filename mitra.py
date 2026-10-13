@@ -60,9 +60,11 @@ def separatePayloads(fn, exts, data, swaps, overlap):
 	return
 
 
-def writeFile(name, exts, data, swaps=[], overlap=b""):
+def writeFile(name, exts, data, swaps=None, overlap=b""):
 	OutDir, NoFile, Split = getVars(["OUTDIR", "NOFILE", "SPLIT"])
 
+	if swaps is None:
+		swaps = []
 	random.seed(0)
 	hash = hashlib.sha256(data).hexdigest()[:8].lower()
 
@@ -175,7 +177,6 @@ def isZipperOk(ftype1, ftype2):
 
 
 def Hit(type1, type2):
-	global VERBOSE
 	if getVar("VERBOSE"):
 		dprint("HIT " + ";".join(sorted([type1, type2])))
 
