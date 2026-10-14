@@ -1,0 +1,11 @@
+pandas
+numpy
+scikit-learn
+lightgbm
+xgboost
+torch
+tensorflow
+onnxruntime
+fastapi
+uvicorn[standard]
+pydantic

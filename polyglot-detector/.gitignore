@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+trained_models/
+feature_matrix.csv
+compatibility_report.csv
+generated_polyglots/
+dataset/
+*.onnx
+.DS_Store
