@@ -33,9 +33,12 @@ def main(path, out):
 	spw = (y == 0).sum() / max((y == 1).sum(), 1)
 	print("samples %d  pos %d  neg %d  features %d  neg/pos %.2f" % (len(y), y.sum(), (y == 0).sum(), X.shape[1], spw))
 
+	# polyglots are split by format pair (unseen pairs at test time); negatives by file,
+	# since holding out e.g. every system PNG at once starves training of clean PNGs
+	g_split = np.where(y == 1, g, names)
 	oof = np.zeros(len(y))
 	cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=0)
-	for k, (tr, te) in enumerate(cv.split(X, y, g)):
+	for k, (tr, te) in enumerate(cv.split(X, y, g_split)):
 		m = xgb.XGBClassifier(scale_pos_weight=spw, random_state=k, **PARAMS).fit(X[tr], y[tr], sample_weight=w[tr])
 		oof[te] = m.predict_proba(X[te])[:, 1]
 	pred = oof >= 0.5
