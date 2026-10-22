@@ -130,6 +130,118 @@ def entropy(b):
 	return float(-(p * np.log2(p)).sum())
 
 
+
+# --------------------------------------------------------------------------
+# Whole-file streaming scan (files larger than the head/tail windows).
+# 3-5 byte signatures hit by chance in compressed/random data (~0.2 expected
+# hits per GiB per signature), so every candidate hit in the middle of a file is
+# confirmed with a cheap structural check on the bytes that follow it.
+# --------------------------------------------------------------------------
+def _u16(b, o): return b[o] | (b[o + 1] << 8)
+def _u32be(b, o): return int.from_bytes(b[o:o + 4], "big")
+
+_VERIFY = {
+	"zip": lambda b, p: _u16(b, p + 4) <= 63 and 1 <= _u16(b, p + 26) <= 512 and b[p + 30] >= 32,
+	"zip_cd": lambda b, p: _u16(b, p + 4) <= 99 and 1 <= _u16(b, p + 28) <= 512 and b[p + 46] >= 32,
+	"zip_eocd": lambda b, p: _u16(b, p + 4) <= 1 and _u16(b, p + 20) < 4096,
+	"pdf": lambda b, p: re.match(rb"[12]\.\d", b[p + 5:p + 8]) is not None,
+	"gif": lambda b, p: _u16(b, p + 6) > 0 and _u16(b, p + 8) > 0,
+	"gif87": lambda b, p: _u16(b, p + 6) > 0 and _u16(b, p + 8) > 0,
+	"jpg": lambda b, p: b[p + 6:p + 10] in (b"JFIF", b"Exif"),
+	"7z": lambda b, p: b[p + 6] == 0,
+	"gzip": lambda b, p: b[p + 3] & 0xE0 == 0 and b[p + 8] in (0, 2, 4) and b[p + 9] <= 13,
+	"bzip2": lambda b, p: 0x31 <= b[p + 3] <= 0x39 and b[p + 4:p + 10] == b"1AY&SY",
+	"elf": lambda b, p: b[p + 4] in (1, 2) and b[p + 5] in (1, 2) and b[p + 6] == 1,
+	"pe": lambda b, p: _u16(b, p + 4) in (0x14c, 0x8664, 0x1c0, 0xaa64),
+	"riff": lambda b, p: re.fullmatch(rb"[A-Za-z0-9 ]{4}", b[p + 8:p + 12]) is not None,
+	"ogg": lambda b, p: b[p + 4] == 0 and b[p + 5] < 8,
+	"flac": lambda b, p: b[p + 4] & 0x7F == 0 and b[p + 5:p + 8] == b"\x00\x00\x22",
+	"id3": lambda b, p: 2 <= b[p + 3] <= 4 and b[p + 4] == 0 and all(c < 0x80 for c in b[p + 6:p + 10]),
+	"ebml": lambda b, p: b[p + 4] & 0x80 != 0,
+	"mp4": lambda b, p: p >= 4 and 12 <= _u32be(b, p - 4) <= 256,
+	"psd": lambda b, p: b[p + 4:p + 6] == b"\x00\x01",
+	"tiff_le": lambda b, p: 8 <= int.from_bytes(b[p + 4:p + 8], "little") < (1 << 20),
+	"tiff_be": lambda b, p: 8 <= _u32be(b, p + 4) < (1 << 20),
+	"cab": lambda b, p: b[p + 4:p + 8] == b"\0\0\0\0",
+	"woff": lambda b, p: b[p + 4:p + 8] in (b"\x00\x01\x00\x00", b"OTTO", b"true"),
+	"ps": lambda b, p: b[p + 4:p + 5] == b"-",
+	"rtf": lambda b, p: b[p + 5:p + 6] == b"1",
+	"dicom": lambda b, p: b[p + 4:p + 6] == b"\x02\x00",
+	"tar": lambda b, p: b[p + 5:p + 6] in (b"\0", b" ", b"0"),
+	"iso": lambda b, p: b[p + 5] == 1,
+	"java": lambda b, p: b[p + 4:p + 6] == b"\0\0" and 45 <= b[p + 7] <= 75,
+	"wasm": lambda b, p: b[p + 4:p + 8] == b"\x01\0\0\0",
+	"pcap": lambda b, p: b[p + 4:p + 6] == b"\x02\x00",
+	"flv": lambda b, p: b[p + 4] in (1, 4, 5) and b[p + 5:p + 9] == b"\0\0\0\x09",
+}
+# kinds scanned in the middle of big files: verified kinds + long literals that need no check
+_MID_KINDS = [k for k in EMBEDDED if k in _VERIFY or k in ("png", "png_iend", "pdf_eof", "rar", "xz", "ar", "bplist")]
+_SCAN_CHUNK = 16 * 1024 * 1024
+_SCAN_PAD = 80
+_KIND_CAP = 20
+
+
+def _scan_region(args):
+	"""Scan file bytes [lo, hi) -> {kind: (count, first_offset)} of verified hits."""
+	path, lo, hi = args
+	out = {}
+	with open(path, "rb") as fh:
+		pos = lo
+		while pos < hi:
+			start = max(pos - 8, 0)                      # context before (mp4 box size)
+			fh.seek(start)
+			buf = fh.read(min(pos + _SCAN_CHUNK, hi) - start + _SCAN_PAD)
+			if not buf:
+				break
+			for k in _MID_KINDS:
+				sig = EMBEDDED[k]
+				c, first = out.get(k, (0, -1))
+				if c >= _KIND_CAP:
+					continue
+				i = buf.find(sig)
+				while i >= 0:
+					abs_ = start + i
+					if pos <= abs_ < hi:
+						try:
+							ok = _VERIFY[k](buf, i) if k in _VERIFY else True
+						except IndexError:
+							ok = False
+						if ok:
+							c += 1
+							first = abs_ if first < 0 else first
+							if c >= _KIND_CAP:
+								break
+					i = buf.find(sig, i + 1)
+				out[k] = (c, first)
+			pos += _SCAN_CHUNK
+	return out
+
+
+def scan_middle(path, lo, hi, workers=None):
+	"""Parallel scan of [lo, hi); regions are split across processes."""
+	import concurrent.futures as cf
+	workers = workers or int(os.environ.get("POLYGLOT_SCAN_WORKERS", os.cpu_count() or 1))
+	span = hi - lo
+	if span <= 0:
+		return {}
+	parts = max(1, min(workers * 2, span // _SCAN_CHUNK or 1))
+	step = -(-span // parts)
+	jobs = [(path, lo + i * step, min(lo + (i + 1) * step, hi)) for i in range(parts)]
+	merged = {}
+	if parts == 1 or workers == 1:
+		results = map(_scan_region, jobs)
+	else:
+		ex = cf.ProcessPoolExecutor(max_workers=workers)
+		results = ex.map(_scan_region, jobs)
+	for r in results:
+		for k, (c, first) in r.items():
+			c0, f0 = merged.get(k, (0, -1))
+			merged[k] = (c0 + c, f0 if f0 >= 0 else first)
+	if parts > 1 and workers > 1:
+		ex.shutdown()
+	return merged
+
+
 class Src:
 	"""Random-access view of a file. Only `head`/`tail` windows are held in memory,
 	so a multi-GB file costs a few MB. Files <= 2*WINDOW are held whole."""
@@ -214,12 +326,17 @@ def _pdf_eof_end(src):
 FEATURE_NAMES = None
 
 
-def extract_file(path):
-	"""path -> features, in O(1) memory for any file size (head/tail windows + seeks)."""
-	return extract(Src(path=path))
+def extract_file(path, deep=True):
+	"""path -> features, in O(1) memory for any file size.
+
+	Head/tail windows + seeks give the structural features. With deep=True (default)
+	files larger than the windows are additionally streamed end to end (in parallel)
+	so embedded payloads in the middle of the file are counted too.
+	"""
+	return extract(Src(path=path), deep=deep)
 
 
-def extract(src):
+def extract(src, deep=True):
 	"""bytes | Src -> dict[str, float]"""
 	if isinstance(src, (bytes, bytearray)):
 		src = Src(data=bytes(src))
@@ -271,18 +388,32 @@ def extract(src):
 	f["anchored_mix"] = float(len(anchored_hits) >= 2)
 
 	# --- embedded signatures (past offset 0) ---
+	# segments: (bytes, absolute offset of its first byte)
+	segs = [(src.head, 0)] if src.whole else [(src.head, 0), (src.tail, n - len(src.tail))]
+	mid = {}
+	if deep and not src.whole and src.path:
+		mid = scan_middle(src.path, len(src.head), n - len(src.tail))
 	n_embedded_kinds = 0
 	first_offs = []
 	total_emb = 0
 	for k, rx in _EMB_RE.items():
-		hits = [m.start() for m in rx.finditer(d)]
-		hits_nz = [h for h in hits if h > 0]
-		f["e_" + k] = float(min(len(hits_nz), 20))
-		if hits_nz and k not in ("zip_cd", "zip_eocd", "pdf_eof", "png_iend", "script",
-								 "gzip", "bzip2", "pe", "riff", "id3", "html", "svg", "xml"):
+		cnt, first = 0, -1
+		for buf, base in segs:
+			for m in rx.finditer(buf):
+				a = base + m.start()
+				if a > 0:
+					cnt += 1
+					first = a if first < 0 else first
+		if k in mid:
+			c, fo = mid[k]
+			cnt += c
+			first = fo if first < 0 else first
+		f["e_" + k] = float(min(cnt, 20))
+		if cnt and k not in ("zip_cd", "zip_eocd", "pdf_eof", "png_iend", "script",
+							 "gzip", "bzip2", "pe", "riff", "id3", "html", "svg", "xml"):
 			n_embedded_kinds += 1
-			first_offs.append(hits_nz[0])
-			total_emb += len(hits_nz)
+			first_offs.append(first)
+			total_emb += cnt
 	f["n_embedded_kinds"] = float(n_embedded_kinds)
 	f["embedded_total"] = float(min(total_emb, 100))
 	f["embedded_first_off_log"] = math.log2(min(first_offs) + 1) if first_offs else -1.0
