@@ -181,6 +181,17 @@ _SCAN_PAD = 80
 _KIND_CAP = 20
 
 
+def _confirm(kind, buf, pos):
+	"""structural check of a signature hit; unknown kinds / truncated tails are accepted"""
+	v = _VERIFY.get(kind)
+	if v is None:
+		return True
+	try:
+		return bool(v(buf, pos))
+	except IndexError:
+		return True
+
+
 def _scan_region(args):
 	"""Scan file bytes [lo, hi) -> {kind: (count, first_offset)} of verified hits."""
 	path, lo, hi = args
@@ -401,7 +412,7 @@ def extract(src, deep=True):
 		for buf, base in segs:
 			for m in rx.finditer(buf):
 				a = base + m.start()
-				if a > 0:
+				if a > 0 and _confirm(k, buf, m.start()):
 					cnt += 1
 					first = a if first < 0 else first
 		if k in mid:
