@@ -82,13 +82,12 @@ def main():
 
 	def add(path, label, group):
 		try:
-			with open(path, "rb") as fh:
-				d = fh.read()
+			size = os.path.getsize(path)
+			if not (MIN_SIZE <= size <= 5 * MAX_SIZE):
+				return
+			X.append(features.extract_file(path))
 		except OSError:
 			return
-		if not (MIN_SIZE <= len(d) <= 5 * MAX_SIZE):
-			return
-		X.append(features.extract(d))
 		y.append(label)
 		groups.append(group)
 		names.append(path)

@@ -4,6 +4,7 @@ Every feature is computed from the raw bytes only. File size is deliberately
 NOT a feature: the generated polyglots are small, so size would be a shortcut.
 """
 import math
+import os
 import re
 import struct
 
@@ -129,16 +130,57 @@ def entropy(b):
 	return float(-(p * np.log2(p)).sum())
 
 
-def _png_end(d):
+class Src:
+	"""Random-access view of a file. Only `head`/`tail` windows are held in memory,
+	so a multi-GB file costs a few MB. Files <= 2*WINDOW are held whole."""
+	WINDOW = 2 * 1024 * 1024
+
+	def __init__(self, path=None, data=None):
+		self.path = path
+		if data is not None:
+			self.n, self.head, self.tail, self.whole = len(data), data, data, True
+			self._data = data
+			return
+		self.n = os.path.getsize(path)
+		self.whole = self.n <= 2 * self.WINDOW
+		if self.whole:
+			self.head = self.tail = self._data = self.read(0, self.n)
+		else:
+			self.head = self.read(0, self.WINDOW)
+			self.tail = self.read(self.n - self.WINDOW, self.WINDOW)
+			self._data = None
+
+	def read(self, off, size):
+		if self._data_ready():
+			return self._data[off:off + size]
+		if off < 0 or off >= self.n:
+			return b""
+		with open(self.path, "rb") as fh:
+			fh.seek(off)
+			return fh.read(size)
+
+	def _data_ready(self):
+		return getattr(self, "_data", None) is not None
+
+	def sample(self):
+		"""bytes used for window-wise statistics and signature scans"""
+		return self.head if self.whole else self.head + self.tail
+
+
+def _png_end(src):
 	"""Offset right after IEND if the chunk walk is sane, else -1."""
-	if not d.startswith(b"\x89PNG\r\n\x1a\n"):
+	if not src.head.startswith(b"\x89PNG\r\n\x1a\n"):
 		return -1
 	o = 8
-	while o + 12 <= len(d):
-		(n,) = struct.unpack(">I", d[o:o + 4])
-		t = d[o + 4:o + 8]
+	for _ in range(100000):
+		if o + 12 > src.n:
+			break
+		h = src.read(o, 8)
+		if len(h) < 8:
+			break
+		(n,) = struct.unpack(">I", h[:4])
 		o += 12 + n
-		if t == b"IEND":
+		if h[4:8] == b"IEND":
 			return o
 	return -1
 
@@ -150,39 +192,47 @@ def _riff_end(d):
 	return -1
 
 
-def _zip_info(d):
-	"""(eocd_end, cd_offset_ok, locals_before_cd) -> trailing & offset sanity."""
-	i = d.rfind(b"PK\x05\x06")
-	if i < 0 or i + 22 > len(d):
+def _zip_info(src):
+	"""(eocd_end, cd_offset_ok) -> trailing & offset sanity (EOCD found in the tail)."""
+	t = src.tail
+	i = t.rfind(b"PK\x05\x06")
+	if i < 0 or i + 22 > len(t):
 		return -1, -1
-	cd_size, cd_off = struct.unpack("<II", d[i + 12:i + 20])
-	(cl,) = struct.unpack("<H", d[i + 20:i + 22])
-	end = i + 22 + cl
+	cd_size, cd_off = struct.unpack("<II", t[i + 12:i + 20])
+	(cl,) = struct.unpack("<H", t[i + 20:i + 22])
+	end = src.n - len(t) + i + 22 + cl
 	# central directory must sit exactly where the EOCD says (shifted by any prefix)
-	ok = 1 if d[cd_off:cd_off + 4] == b"PK\x01\x02" else 0
+	ok = 1 if src.read(cd_off, 4) == b"PK\x01\x02" else 0
 	return end, ok
 
 
-def _pdf_eof_end(d):
-	i = d.rfind(b"%%EOF")
-	return -1 if i < 0 else i + 5
+def _pdf_eof_end(src):
+	i = src.tail.rfind(b"%%EOF")
+	return -1 if i < 0 else src.n - len(src.tail) + i + 5
 
 
 FEATURE_NAMES = None
 
 
-def extract(d):
-	"""bytes -> dict[str, float]"""
+def extract_file(path):
+	"""path -> features, in O(1) memory for any file size (head/tail windows + seeks)."""
+	return extract(Src(path=path))
+
+
+def extract(src):
+	"""bytes | Src -> dict[str, float]"""
+	if isinstance(src, (bytes, bytearray)):
+		src = Src(data=bytes(src))
 	f = {}
-	n = len(d)
-	head = d[:64]
-	logn = math.log2(n + 1)
+	n = src.n
+	d = src.sample()          # what statistics / signature scans look at
+	head = src.head[:64]
 
 	# --- global statistics (no raw size) ---
 	arr = np.frombuffer(d, np.uint8) if n else np.zeros(1, np.uint8)
 	f["entropy"] = entropy(d)
 	f["entropy_head"] = entropy(d[:1024])
-	f["entropy_tail"] = entropy(d[-1024:])
+	f["entropy_tail"] = entropy(src.tail[-1024:])
 	win = 512
 	ents = [entropy(d[i:i + win]) for i in range(0, max(n - win, 1), win)] or [0.0]
 	ents = np.array(ents)
@@ -239,29 +289,29 @@ def extract(d):
 	f["embedded_density"] = total_emb / max(n, 1) * 1000.0
 
 	# --- structural consistency: logical end vs physical end ---
-	png = _png_end(d)
+	png = _png_end(src)
 	f["png_trailing"] = float(n - png) if png >= 0 else -1.0
 	f["png_trailing_log"] = math.log2(n - png + 1) if png >= 0 else -1.0
-	riff = _riff_end(d)
+	riff = _riff_end(src.head)
 	f["riff_trailing"] = float(n - riff) if riff >= 0 else -9e9
 	f["riff_mismatch"] = float(n != riff) if riff >= 0 else -1.0
-	zend, zok = _zip_info(d)
+	zend, zok = _zip_info(src)
 	f["zip_trailing"] = float(n - zend) if zend >= 0 else -1.0
 	f["zip_cd_ok"] = float(zok)
 	# zip with something before the first local header
-	zi = d.find(b"PK\x03\x04")
+	zi = src.head.find(b"PK\x03\x04")
 	f["zip_prefix_log"] = math.log2(zi + 1) if zi >= 0 else -1.0
 	f["zip_prefix_nz"] = float(zi > 0)
-	pe = _pdf_eof_end(d)
+	pe = _pdf_eof_end(src)
 	f["pdf_trailing"] = float(n - pe) if pe >= 0 else -1.0
-	pi = d.find(b"%PDF-")
+	pi = src.head.find(b"%PDF-")
 	f["pdf_prefix_nz"] = float(pi > 0)
 	f["pdf_prefix_log"] = math.log2(pi + 1) if pi >= 0 else -1.0
 	# jpeg: EOI near end?
-	f["jpg_eoi_end"] = float(d.rstrip(b"\0").endswith(b"\xff\xd9")) if head[:2] == b"\xff\xd8" else -1.0
-	f["gif_trailer_end"] = float(d.rstrip(b"\0").endswith(b";")) if head[:3] == b"GIF" else -1.0
+	f["jpg_eoi_end"] = float(src.tail.rstrip(b"\0").endswith(b"\xff\xd9")) if head[:2] == b"\xff\xd8" else -1.0
+	f["gif_trailer_end"] = float(src.tail.rstrip(b"\0").endswith(b";")) if head[:3] == b"GIF" else -1.0
 	# id3v1 footer, 7z/rar-ish
-	f["id3v1_footer"] = float(n >= 128 and d[-128:-125] == b"TAG")
+	f["id3v1_footer"] = float(n >= 128 and src.tail[-128:-125] == b"TAG")
 	# does the bulk of the file after the first 4 KB sit behind a big gap of identical bytes
 	f["tail_after_zeros"] = float(bool(re.search(rb"\x00{32}[^\x00]", d)))
 

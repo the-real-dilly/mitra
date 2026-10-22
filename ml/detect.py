@@ -25,8 +25,7 @@ def main():
 	m.load_model(a.model)
 	names = json.load(open(a.model.replace(".json", ".features.json")))
 	for p in a.files:
-		with open(p, "rb") as fh:
-			f = features.extract(fh.read())
+		f = features.extract_file(p)
 		x = np.array([[f.get(k, 0.0) for k in names]], dtype=np.float32)
 		s = float(m.predict_proba(x)[0, 1])
 		print("%.4f  %s  %s" % (s, "POLYGLOT" if s >= a.threshold else "clean", p))
